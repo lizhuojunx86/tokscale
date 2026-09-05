@@ -47,6 +47,19 @@ const RPC_PATH: &str = "/exa.language_server_pb.LanguageServerService/RetrieveUs
 /// accepts the connection and then goes quiet.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 
+/// Bound for the real quota fetch, once `discover_port` has vouched for the
+/// port.
+///
+/// A stall guard rather than a budget. `PROBE_TIMEOUT` is short because it
+/// races candidate ports that may belong to anything, and a wrong guess has to
+/// fail fast. By the time `fetch_all` runs, the port is known to speak this
+/// RPC, so the only thing left to bound is a server that accepts and then goes
+/// quiet -- and a loaded machine can push a loopback round trip well past
+/// 400ms. Failing the whole `tokscale usage` report because the box was busy
+/// is worse than waiting. 10s matches the transport timeout the sibling IDE
+/// RPC client in `crate::antigravity` already uses.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 // ── Wire format ──
 
 #[derive(Debug, Deserialize)]
@@ -110,7 +123,7 @@ pub fn fetch_all() -> Result<Vec<UsageOutput>> {
         let port = discover_port()
             .await
             .context("Antigravity language server is not running")?;
-        let summary = call_rpc(port).await?;
+        let summary = call_rpc(port, FETCH_TIMEOUT).await?;
 
         if summary.groups.is_empty() {
             anyhow::bail!("Antigravity is running but not signed in");
@@ -191,8 +204,8 @@ fn metric(bucket: QuotaBucket) -> Option<UsageMetric> {
 
 /// Byte ceiling for one quota response.
 ///
-/// `PROBE_TIMEOUT` bounds how long the language server may take, not how much
-/// it may send inside that window, and `Response::json` buffers the whole body
+/// The request timeout bounds how long the language server may take, not how
+/// much it may send inside that window, and `Response::json` buffers the whole body
 /// before anything looks at it. Port discovery probes candidate ports, so this
 /// also runs against whatever else happens to be listening on loopback -- a
 /// port that answers with an endless stream would otherwise allocate until the
@@ -203,7 +216,7 @@ fn metric(bucket: QuotaBucket) -> Option<UsageMetric> {
 /// leaves room for new fields while keeping the worst case bounded.
 const MAX_QUOTA_BODY_BYTES: usize = 1024 * 1024;
 
-async fn call_rpc(port: u16) -> Result<QuotaSummary> {
+async fn call_rpc(port: u16, timeout: Duration) -> Result<QuotaSummary> {
     // `.no_proxy()` because this only ever targets 127.0.0.1: the default
     // builder honours HTTP_PROXY/system proxy settings, which would send a
     // loopback quota request to a remote host unless the user happens to have
@@ -218,7 +231,7 @@ async fn call_rpc(port: u16) -> Result<QuotaSummary> {
         // 307 with an external URL would carry the request off loopback, and
         // the remote answer would then be accepted as a quota summary.
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(PROBE_TIMEOUT)
+        .timeout(timeout)
         .build()?;
     let response = client
         .post(format!("http://127.0.0.1:{port}{RPC_PATH}"))
@@ -250,13 +263,13 @@ async fn call_rpc(port: u16) -> Result<QuotaSummary> {
 /// HTTPS (gRPC) port and an HTTP one, and only the latter speaks plain JSON.
 async fn discover_port() -> Option<u16> {
     for port in ports_from_cli_log() {
-        if call_rpc(port).await.is_ok() {
+        if call_rpc(port, PROBE_TIMEOUT).await.is_ok() {
             return Some(port);
         }
     }
 
     for connection in crate::antigravity::detect_antigravity_connections().ok()? {
-        if call_rpc(connection.port).await.is_ok() {
+        if call_rpc(connection.port, PROBE_TIMEOUT).await.is_ok() {
             return Some(connection.port);
         }
     }
@@ -328,6 +341,59 @@ fn parse_logged_ports(text: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `fetch_all` used to hand `PROBE_TIMEOUT` to the real quota
+    /// request. That bound is short on purpose -- discovery races candidate
+    /// ports that may belong to anything, so a wrong guess has to fail fast --
+    /// but the fetch runs against a port discovery already vouched for. Reusing
+    /// the probe budget there meant a loaded machine failed `tokscale usage`
+    /// against a language server that was answering perfectly well.
+    #[test]
+    fn the_fetch_budget_outlasts_a_delay_the_probe_budget_abandons() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        // Comfortably past PROBE_TIMEOUT and far short of FETCH_TIMEOUT, so
+        // neither assertion rides a narrow margin when CI is busy.
+        const SERVER_DELAY: Duration = Duration::from_millis(1_500);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            // One connection per call below, each answered on its own thread so
+            // the probe's abandoned connection cannot delay the fetch.
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buffer = [0u8; 1024];
+                    let _ = stream.read(&mut buffer);
+                    std::thread::sleep(SERVER_DELAY);
+                    let body = r#"{"response":{"groups":[]}}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            assert!(
+                call_rpc(port, PROBE_TIMEOUT).await.is_err(),
+                "a port this slow must be abandoned while probing"
+            );
+            call_rpc(port, FETCH_TIMEOUT)
+                .await
+                .expect("the fetch must outlast the same delay");
+        });
+    }
 
     /// The log is appended across every run and never rotated, so the read has
     /// to be bounded -- and the bound has to keep the *end*, because that is
